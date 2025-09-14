@@ -1,0 +1,5 @@
+True ranks
+rP = [5 4 1]
+Starting estimation...
+Estimation completed successfully!
+Final rank estimates: [5 4 1]

@@ -1,0 +1,6 @@
+Compare backslash
+Compare multiply
+Loop time: 0.2725s
+Vectorized time: 0.2566s
+Speedup: 1.06x
+Max difference: 0.00e+00

@@ -1,0 +1,8 @@
+True dimensionality:
+Rank of task variable 1 = 5
+Rank of task variable 2 = 5
+Rank of task variable 3 = 3
+Starting parameter learning...
+Demo completed successfully!
+Estimated noise precisions: mean=0.104, std=0.067
+True noise precisions: mean=1.281, std=1.496
