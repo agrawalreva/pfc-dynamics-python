@@ -5,16 +5,68 @@ def vec(x):
     return x.flatten()
 
 def slow_mult(A, B):
-    """Slow matrix multiply - placeholder"""
-    return A @ B
+    """Slow matrix multiply for 3D arrays"""
+    na = A.shape
+    nb = B.shape
+    
+    if len(na) == 2 and len(nb) == 2:
+        # 2D case - regular matrix multiply
+        return A @ B
+    elif len(na) == 3 and len(nb) == 3:
+        # 3D case - multiply along third dimension
+        if na[2] != nb[2]:
+            raise ValueError('Third dimension of matrices must match')
+        C = np.zeros((na[0], nb[1], na[2]))
+        for ii in range(na[2]):
+            C[:, :, ii] = A[:, :, ii] @ B[:, :, ii]
+        return C
+    else:
+        # Mixed case - try to handle it
+        return A @ B
 
 def slow_backslash(A, B):
-    """Slow backslash - placeholder"""
-    return np.linalg.solve(A, B)
+    """Slow backslash (solve) for 3D arrays"""
+    na = A.shape
+    nb = B.shape
+    
+    if len(na) == 2 and len(nb) == 2:
+        # 2D case - regular solve
+        return np.linalg.solve(A, B)
+    elif len(na) == 3:
+        # 3D case - solve along third dimension
+        if len(nb) == 2:
+            # B is 2D, broadcast
+            C = np.zeros((na[0], nb[1], na[2]))
+            for ii in range(na[2]):
+                C[:, :, ii] = np.linalg.solve(A[:, :, ii], B)
+        elif len(nb) == 3:
+            if na[2] != nb[2]:
+                raise ValueError('Third dimension of matrices must match')
+            C = np.zeros((na[0], nb[1], na[2]))
+            for ii in range(na[2]):
+                C[:, :, ii] = np.linalg.solve(A[:, :, ii], B[:, :, ii])
+        else:
+            raise ValueError('Incompatible dimensions')
+        return C
+    else:
+        # 2D case
+        return np.linalg.solve(A, B)
 
 def slow_chol(A):
-    """Slow cholesky - placeholder"""
-    return np.linalg.cholesky(A)
+    """Slow cholesky for 3D arrays"""
+    na = A.shape
+    
+    if len(na) == 2:
+        # 2D case - regular cholesky
+        return np.linalg.cholesky(A)
+    elif len(na) == 3:
+        # 3D case - cholesky along third dimension
+        C = np.zeros(na)
+        for ii in range(na[2]):
+            C[:, :, ii] = np.linalg.cholesky(A[:, :, ii])
+        return C
+    else:
+        return np.linalg.cholesky(A)
 
 def kronmult(Amats, x, ii=None):
     """

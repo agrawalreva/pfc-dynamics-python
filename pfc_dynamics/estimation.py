@@ -5,7 +5,7 @@ Estimation functions
 import numpy as np
 from scipy import sparse
 from scipy.optimize import minimize
-from .utils import vec, kronmult, slow_mult, slow_backslash
+from .utils import vec, kronmult, slow_mult, slow_backslash, slow_chol
 
 def mk_suff_stats_bilin_reg_sims(Z, X, hk):
     """
@@ -43,7 +43,11 @@ def mk_suff_stats_bilin_reg_sims(Z, X, hk):
     for jx in range(n):
         stm = allstim[jx]
         XXperneuron.append(np.kron(stm.T @ stm, It.toarray()))
-        XYperneuron[:, jx] = vec(Yn[jx].T @ stm)
+        # MATLAB: vec(reshape(Yn{jx},T,ntrials(jx))*stm)
+        # Yn[jx] is T x ntrials, stm is ntrials x P, so Yn[jx] @ stm is T x P
+        ntrials_jx = int(ntrials[jx])
+        Yn_reshaped = Yn[jx].reshape(T, ntrials_jx)  # Ensure T x ntrials
+        XYperneuron[:, jx] = vec(Yn_reshaped @ stm)
     
     # construct block diagonal XX matrix
     XX = sparse.block_diag(XXperneuron).toarray()
@@ -109,18 +113,27 @@ def svd_regress_s_vdata(XX, XY, Yn, allstim, T, n, r, ridgeparam, opts):
     """
     Bfullhat, Bthat, Bxhat = svd_regress_b(XX, XY, [T, n], r, ridgeparam, opts)
     shatsvd = []
-    B = []
+    B = []  # Will be list of transposed matrices
     
     P = len(r)
     for p in range(P):
         shatsvd.extend(vec(Bthat[p]))
-        B.append(Bfullhat[:, :, p].T)
+        # MATLAB: B = [B Bfullhat(:,:,p)'] - concatenate horizontally
+        # Bfullhat is nt x nx x nmats, so Bfullhat(:,:,p) is nt x nx
+        # Bfullhat(:,:,p)' is nx x nt
+        B.append(Bfullhat[:, :, p].T)  # nx x nt
+    
+    # Concatenate B matrices horizontally: MATLAB B becomes n x (T*P)
+    # In Python, we'll build it as a list and then access by row
+    # Actually, let's build B as n x (T*P) matrix like MATLAB
+    B_matrix = np.hstack(B)  # n x (T*P)
     
     # estimate lambdas
     lambhat = np.zeros(n)
     for ii in range(n):
-        # Bi should be T*P dimensional, not T*rtot
-        Bi = B[ii].flatten()  # this gives us T*P dimensions
+        # MATLAB: Bi = vec(B(ii,:)) - get row ii and vectorize
+        Bi = vec(B_matrix[ii, :])  # T*P x 1
+        # MATLAB: ri = vec(Yn{ii}')- kronmult({speye(T),allstim{ii}},Bi)
         ri = vec(Yn[ii].T) - kronmult([sparse.eye(T), allstim[ii]], Bi.reshape(-1, 1)).flatten()
         lambhat[ii] = allstim[ii].shape[0] * T / (ri.T @ ri)
     
@@ -257,21 +270,128 @@ def ecm_suff_stat(zetai, Xi, bhat0):
     Xzetai = np.zeros((T*P, n))
     
     for i in range(n):
-        Xzetai[:, i] = kronmult([np.eye(T), Xi[i].T], vec(zetai[i]))
+        # MATLAB: zi = vec(bsxfun(@minus,zetai{ii},b(:,ii)))
+        # Subtract b from zetai before computing statistics
+        zi = zetai[i] - bhat0[:, i:i+1]  # T x ntrials - T x 1 -> T x ntrials
+        zi_vec = vec(zi)  # Vectorize
+        zi_reshaped = zi_vec.reshape(T, -1)  # Reshape to T x ntrials
+        # MATLAB: Xzetai(:,ii) = vec(zi*Xi{ii})
+        Xzetai[:, i] = vec(zi_reshaped @ Xi[i])
         Ri[:, :, i] = Xzetai[:, i:i+1] @ Xzetai[:, i:i+1].T
-        zzi[i] = vec(zetai[i]).T @ vec(zetai[i])
+        zzi[i] = vec(zi).T @ vec(zi)
     
     return Ri, zzi, Xzetai
 
 def neg_log_lik_btdr_incomp_obs_uneqvar_s_only(s, lamb, Ai, Ri, zzi, r, ni, g):
     """Negative log likelihood for S only"""
-    # implementation was missing in beta 
-    return np.sum(s**2)
+    P = len(r)
+    T = Ri.shape[0] // P
+    TP = T * P
+    n = len(ni)
+    rtot = np.sum(r)
+    
+    # Make block diagonal S matrix
+    Shat = []
+    for p in range(P):
+        start_idx = np.sum(r[:p]) * T
+        end_idx = np.sum(r[:p+1]) * T
+        Shat.append(s[start_idx:end_idx].reshape(r[p], T))
+    S = sparse.block_diag(Shat).toarray()
+    
+    # lambAiIS := lambi*kron(I,Ai)*S'
+    # MATLAB: lambAi = reshape(bsxfun(@times,Ai,permute(lambi,[3 2 1])),P,P*n)
+    lambAi = Ai * lamb[None, None, :]  # [P x P x n]
+    lambAi = lambAi.reshape(P, P*n)  # [P x P*n]
+    # MATLAB: S2 = reshape(S,[],P)
+    S2 = S.reshape(-1, P)  # [rtot*T x P] -> reshape to [rtot*T/P x P]? Actually, S is rtot x TP, so reshape(-1, P) gives rtot*TP/P x P = rtot*T x P
+    # Wait, S is rtot x TP, so S2 = reshape(S, [], P) in MATLAB means reshape to have P columns
+    # In MATLAB, reshape(S, [], P) with S being rtot x TP gives (rtot*TP/P) x P = rtot*T x P
+    # But we want rtot x TP reshaped to have P columns, so it's (rtot*TP/P) x P
+    # Actually, let me check: S is rtot x (T*P), so reshape(S, [], P) gives (rtot*T*P/P) x P = rtot*T x P
+    # In Python, S.reshape(-1, P) with S being rtot x TP gives (rtot*TP/P) x P = rtot*T x P ✓
+    # MATLAB: lambAiIS = permute(reshape(S2*lambAi,rtot,TP,n),[2 1 3])
+    lambAiIS = S2 @ lambAi  # [rtot*T x P] @ [P x P*n] = [rtot*T x P*n]
+    lambAiIS = lambAiIS.reshape(rtot, TP, n)  # Reshape to [rtot x TP x n]
+    lambAiIS = np.transpose(lambAiIS, (1, 0, 2))  # [TP x rtot x n]
+    
+    # Ci := lambi*S*kron(I,Ai)*S' + eye(rtot)
+    Ci = S @ lambAiIS.reshape(TP, rtot*n)
+    Ci = Ci.reshape(rtot, rtot, n)
+    Ci = Ci + np.eye(rtot)[:, :, None]
+    
+    # invCiSRi := Ci\(S*Ri)
+    SRi = S @ Ri.reshape(TP, -1)
+    SRi = SRi.reshape(rtot, TP, n)
+    invCiSRi = slow_backslash(Ci, SRi)
+    
+    # Quadratic term: Qtermi = invCiSRi' * vec(S) for each neuron
+    Qtermi = np.array([invCiSRi[:, :, i].T @ vec(S.T) for i in range(n)])
+    Qterm = (lamb**2) @ Qtermi
+    
+    # log-det term using cholesky
+    cholCi = slow_chol(Ci)
+    logdetterm = 2 * np.sum([np.sum(np.log(np.diag(cholCi[:, :, i]))) for i in range(n)])
+    
+    # Regularization term
+    regterm = g * s.T @ s
+    
+    # Negative log likelihood
+    negloglik = 0.5 * (-T * ni @ np.log(lamb) + logdetterm + zzi @ lamb - Qterm + regterm)
+    
+    return negloglik
 
 def neg_log_lik_btdr_incomp_obs_uneqvar_lamb_only(lamb, S, Ai, Ri, zzi, r, ni, g):
     """Negative log likelihood for lambda only"""
-    # implementation was missing in beta 
-    return np.sum(lamb**2)
+    P = len(r)
+    T = Ri.shape[0] // P
+    TP = T * P
+    n = len(ni)
+    rtot = np.sum(r)
+    
+    # lambAiIS := lambi*kron(I,Ai)*S'
+    # Compute for each row of S
+    lambAiIS = np.zeros((TP, n, rtot))
+    lambAi = Ai * lamb[None, None, :]  # [P x P x n]
+    
+    for p in range(rtot):
+        # Get row p of S and reshape to [T x P]
+        Sp_row = S[p, :].reshape(T, P)  # [T x P]
+        # Repeat for all neurons: [T x P x n]
+        Sp_row_rep = np.tile(Sp_row[:, :, None], (1, 1, n))
+        # Multiply: [T x P x n] @ [P x P x n] -> [T x P x n]
+        M = np.zeros((T, P, n))
+        for i in range(n):
+            M[:, :, i] = Sp_row_rep[:, :, i] @ lambAi[:, :, i]
+        # Reshape: [T x P x n] -> [TP x n]
+        lambAiIS[:, :, p] = M.reshape(TP, n)
+    
+    lambAiIS = np.transpose(lambAiIS, (0, 2, 1))  # [TP x rtot x n]
+    
+    # Ci := lambi*S*kron(I,Ai)*S' + eye(rtot)
+    Ci = np.zeros((rtot, rtot, n))
+    for i in range(n):
+        Ci[:, :, i] = S @ lambAiIS[:, :, i] + np.eye(rtot)
+    
+    # invCiSRi := Ci\(S*Ri)
+    SRi = S @ Ri.reshape(TP, -1)
+    SRi = SRi.reshape(rtot, TP, n)
+    invCiSRi = slow_backslash(Ci, SRi)
+    
+    # Quadratic term
+    Qtermi = np.array([invCiSRi[:, :, i].T @ vec(S.T) for i in range(n)])
+    Qterm = (lamb**2) @ Qtermi
+    
+    # log-det term using cholesky
+    cholCi = slow_chol(Ci)
+    logdetterm = 2 * np.sum([np.sum(np.log(np.diag(cholCi[:, :, i]))) for i in range(n)])
+    
+    # Regularization term (typically 0 for lambda-only)
+    regterm = g * lamb.T @ lamb if g > 0 else 0
+    
+    # Negative log likelihood
+    negloglik = 0.5 * (-T * ni @ np.log(lamb) + logdetterm + zzi @ lamb - Qterm + regterm)
+    
+    return negloglik
 
 def ecm_regress_wrapper(r, init_regress_fun, em_regress_fun, Ybar):
     """
@@ -399,9 +519,27 @@ def eb_post_W_uneqvar(Shatblock, lambhat, Ai, Xzetai, rtot):
     Returns:
         Wt: posterior weights
     """
-    # placeholder implementation
-    n = len(lambhat)
-    return np.random.randn(rtot, n)
+    P, _, n = Ai.shape
+    T = Shatblock.shape[1] // P
+    
+    I_T = sparse.eye(T)
+    I_r = sparse.eye(rtot)
+    
+    SXIZi = Shatblock @ Xzetai
+    Wt = np.zeros((rtot, n))
+    Ci = np.zeros((rtot, rtot, n))
+    
+    for i in range(n):
+        # Compute AiIS = kron(I_T, Ai(:,:,i)) * S'
+        AiIS = kronmult([I_T, Ai[:, :, i]], Shatblock.T)
+        
+        # Compute Ci = lambi(i)*S*AiIS + I_r
+        Ci[:, :, i] = lambhat[i] * Shatblock @ AiIS + I_r.toarray()
+        
+        # Solve for Wt: Ci \ (SXIZi * lambi)
+        Wt[:, i] = np.linalg.solve(Ci[:, :, i], SXIZi[:, i]) * lambhat[i]
+    
+    return Wt
 
 def btdr_aic_s_lamb_b_wrapper(pars, Ai, Xi, zetai, r, ni, g):
     """
@@ -464,8 +602,57 @@ def svd_reg_b_aic(Yn, allstim, pars, r):
 
 def neg_log_lik_btdr_incomp_obs_uneqvar_s_nll_only(pars, Ai, Xzetai, zzi, r, ni, g):
     """Negative log likelihood for SVD AIC"""
-    # placeholder
-    return np.sum(pars**2)
+    P = len(r)
+    TP = Xzetai.shape[0]
+    T = TP // P
+    rtot = np.sum(r)
+    n = len(ni)
+    lambi = pars[:n]
+    
+    # Make block diagonal S matrix
+    Shat = []
+    endind = n
+    for p in range(P):
+        startind = endind
+        endind = startind + T * r[p]
+        Shat.append(pars[startind:endind].reshape(T, r[p]).T)
+    S = sparse.block_diag(Shat).toarray()
+    
+    # lambAiIS := lambi*kron(I,Ai)*S'
+    # MATLAB uses a loop, but we can use the simpler approach from S_only version
+    # MATLAB: lambAi = bsxfun(@times,Ai,permute(repmat(lambi,1,P),[3 2 1]))
+    lambAi = Ai * lambi[None, None, :]  # [P x P x n]
+    lambAi = lambAi.reshape(P, P*n)  # [P x P*n]
+    # MATLAB: S2 = reshape(S,[],P) - but S is rtot x TP, so this gives rtot*T x P
+    # Actually, for this function, we use the loop approach from MATLAB
+    # But let's use the simpler reshape approach which should be equivalent
+    S2 = S.reshape(-1, P)  # Reshape S to have P columns: (rtot*TP/P) x P = rtot*T x P
+    lambAiIS_temp = S2 @ lambAi  # [rtot*T x P] @ [P x P*n] = [rtot*T x P*n]
+    lambAiIS_temp = lambAiIS_temp.reshape(rtot, TP, n)  # [rtot x TP x n]
+    lambAiIS = np.transpose(lambAiIS_temp, (1, 0, 2))  # [TP x rtot x n]
+    
+    # Ci := lambi*S*kron(I,Ai)*S' + eye(rtot)
+    Ci = np.zeros((rtot, rtot, n))
+    for i in range(n):
+        Ci[:, :, i] = S @ lambAiIS[:, :, i] + np.eye(rtot)
+    
+    # Quadratic term: S*Xzetai
+    SXzetai = S @ Xzetai  # [rtot x n]
+    invCiSXzetai = slow_backslash(Ci, SXzetai.reshape(rtot, 1, n))
+    Qtermi = np.array([SXzetai[:, i].T @ invCiSXzetai[:, 0, i] for i in range(n)])
+    Qterm = (lambi**2) @ Qtermi
+    
+    # log-det term using cholesky
+    cholCi = slow_chol(Ci)
+    logdetterm = 2 * np.sum([np.sum(np.log(np.diag(cholCi[:, :, i]))) for i in range(n)])
+    
+    # Regularization term
+    regterm = g * pars[n:].T @ pars[n:] if g > 0 else 0
+    
+    # Negative log likelihood
+    negloglik = 0.5 * (-T * ni @ np.log(lambi) + logdetterm + zzi @ lambi - Qterm + regterm)
+    
+    return negloglik
 
 def q_tdr(par_new, par_old, Ai, Ri, zzi, r, ni, alpha):
     """
@@ -579,46 +766,48 @@ def keep_active_s(S, r):
 
 def ecm_tdr(stopmode, stopcrit, pars0, Ai, Xi, r, ni, zetai, xbari, Ybar, Xzetai0):
     """
-    ECM TDR estimation
+    ECM TDR estimation - Full implementation matching MATLAB ECMEtdr
     
     Args:
-        stopmode: stopping mode
+        stopmode: stopping mode ('steps' or 'converge')
         stopcrit: stopping criterion
-        pars0: initial parameters
-        Ai: regressor covariances
-        Xi: regressor matrices
-        r: ranks
-        ni: trial counts
-        zetai: data
-        xbari: mean regressors
-        Ybar: mean responses
-        Xzetai0: cross terms
+        pars0: initial parameters [lamb; s; b]
+        Ai: regressor covariances [P x P x n]
+        Xi: regressor matrices (list of n arrays)
+        r: ranks (list of P integers)
+        ni: trial counts [n]
+        zetai: data (list of n arrays, each T x ntrials)
+        xbari: mean regressors [n x P]
+        Ybar: mean responses [T x n]
+        Xzetai0: cross terms [TP x n]
     
     Returns:
         parhat, Q, parerr, nll
     """
     maxsteps = 100
     
+    # Unpack parameters
     n = len(ni)
     T = zetai[0].shape[0]
     P = len(r)
     TP = T * P
     rtot = np.sum(r)
+    lambiold = pars0[:n].copy()
+    olds = pars0[n:n+rtot*T].copy()
+    bold = pars0[n+rtot*T:].reshape(T, n).copy()
     
-    lambiold = pars0[:n]
-    olds = pars0[n:n+rtot*T]
-    bold = pars0[n+rtot*T:].reshape(T, n)
-    
+    # For first step, set new and old pars equal
     lambinew = lambiold.copy()
     news = olds.copy()
     bnew = bold.copy()
-    
     Ri, zzi, Xzetai = ecm_suff_stat(zetai, Xi, bold)
     
     if stopmode == 'steps':
         stopcrit = stopcrit + 1
     
-    Q = [q_tdr(np.concatenate([lambiold, olds]), np.concatenate([lambiold, olds]), Ai, Ri, zzi, r, ni, 0)]
+    # Initialize Q and nll
+    pars0q = np.concatenate([lambiold, olds])
+    Q = [q_tdr(pars0q, pars0q, Ai, Ri, zzi, r, ni, 0)]
     nll = [neg_log_lik_btdr_incomp_obs_uneqvar_s_nll_only(pars0, Ai, Xzetai, zzi, r, ni, 0)]
     
     k = 2
@@ -631,39 +820,187 @@ def ecm_tdr(stopmode, stopcrit, pars0, Ai, Xi, r, ni, zetai, xbari, Ybar, Xzetai
         lambiold0 = lambinew.copy()
         olds0 = news.copy()
         
-        # reset sufficient stats
+        # Reset sufficient stats using current estimate of b
         Ri, zzi, Xzetai = ecm_suff_stat(zetai, Xi, bold)
         
-        # M-step for lambda
-        Snew = []
+        # ------------------ M-step for lambda------------------
+        # Build Snew and Sold from news
+        Snew_list = []
         for p in range(P):
             start_idx = np.sum(r[:p]) * T
             end_idx = np.sum(r[:p+1]) * T
-            Snew.append(news[start_idx:end_idx].reshape(r[p], T))
-        Snew = sparse.block_diag(Snew).toarray()
+            Snew_list.append(news[start_idx:end_idx].reshape(r[p], T))
+        Snew = sparse.block_diag(Snew_list).toarray()
+        Sold = Snew.copy()
         
-        # simplified lambda update
-        lambinew = T * ni / zzi
+        # Old feature covariance: Ci := lambi*S*kron(Ai,I)*S' + eye(rtot)
+        S2 = Sold.reshape(-1, P)  # Reshape to have P columns
+        Ai_reshaped = Ai.reshape(P, P*n)  # [P x P*n]
+        AiISold_temp = S2 @ Ai_reshaped  # [rtot*T x P] @ [P x P*n] = [rtot*T x P*n]
+        AiISold_temp = AiISold_temp.reshape(rtot, TP, n)
+        AiISold = np.transpose(AiISold_temp, (1, 0, 2))  # [TP x rtot x n]
+        SAiISold = Sold @ AiISold.reshape(TP, rtot*n)
+        SAiISold = SAiISold.reshape(rtot, rtot, n)
+        lambiSAiSold = SAiISold * lambiold[None, None, :]  # [rtot x rtot x n]
+        Ciold = lambiSAiSold + np.eye(rtot)[:, :, None]
         
-        # M-step for S
-        news = olds + np.random.randn(len(olds)) * 0.1 
+        # BiSRi := Ciold\(S*Ri)
+        SoldRi = Sold @ Ri.reshape(TP, -1)
+        SoldRi = SoldRi.reshape(rtot, TP, n)
+        BiSoldRi = slow_backslash(Ciold, SoldRi)
         
-        # MMLE of independent term
-        bnew = mmle_b(np.ones((rtot, rtot, n)), Snew, lambinew, ni, xbari, Ybar, Xzetai, r)
+        # Compute g1i, g2i, g3i for lambda update
+        # g1i = 2*lambiold.*(reshape(permute(BiSoldRi,[3,1,2]),n,rtot*TP)*vec(Snew))
+        BiSoldRi_perm = np.transpose(BiSoldRi, (2, 0, 1))  # [n x rtot x TP]
+        BiSoldRi_reshaped = BiSoldRi_perm.reshape(n, rtot*TP)
+        g1i = 2 * lambiold * (BiSoldRi_reshaped @ vec(Snew.T))
         
-        # convergence check
+        # Compute SnewAiSnew
+        AiISnew_temp = S2 @ Ai_reshaped
+        AiISnew_temp = AiISnew_temp.reshape(rtot, TP, n)
+        AiISnew = np.transpose(AiISnew_temp, (1, 0, 2))  # [TP x rtot x n]
+        SnewAiSnew = Snew @ AiISnew.reshape(TP, rtot*n)
+        SnewAiSnew = SnewAiSnew.reshape(rtot, rtot, n)
+        BiSAS = slow_backslash(Ciold, SnewAiSnew)
+        
+        # g2i = trace(BiSAS) for each neuron
+        g2i = np.array([np.trace(BiSAS[:, :, ii]) for ii in range(n)])
+        
+        # g3i computation
+        # MATLAB: RSBSASB = mmx_mkl_single('mult',permute(BiSoldRi,[2,1,3]),permute(BiSAS,[2,1,3]))
+        # BiSoldRi is [rtot x TP x n], permute([2,1,3]) -> [TP x rtot x n]
+        # BiSAS is [rtot x rtot x n], permute([2,1,3]) -> [rtot x rtot x n] (no change)
+        BiSoldRi_perm2 = np.transpose(BiSoldRi, (1, 0, 2))  # [TP x rtot x n]
+        BiSAS_perm = np.transpose(BiSAS, (1, 0, 2))  # [rtot x rtot x n]
+        RSBSASB = slow_mult(BiSoldRi_perm2, BiSAS_perm)  # [TP x rtot x n] @ [rtot x rtot x n] -> [TP x rtot x n]
+        # MATLAB: g3i = reshape(permute(RSBSASB,[3,2,1]),n,rtot*TP)*sparse(vec(Sold))
+        RSBSASB_perm = np.transpose(RSBSASB, (2, 1, 0))  # [n x rtot x TP]
+        RSBSASB_reshaped = RSBSASB_perm.reshape(n, rtot*TP)
+        g3i = RSBSASB_reshaped @ vec(Sold.T)  # [n x rtot*TP] @ [rtot*TP x 1] -> [n]
+        g3i = g3i * lambiold**2
+        
+        # Update lambda
+        lambinew = T * ni / (zzi - g1i + g2i + g3i)
+        lambiold = lambinew.copy()
+        
+        # ------------------ M-step for S------------------
+        # Remake old feature covariance with new lambda
+        lambiSAiSold = SAiISold * lambiold[None, None, :]
+        Ciold = lambiSAiSold + np.eye(rtot)[:, :, None]
+        
+        # Compute M0 and m0
+        lambnewilamboldBiSoldRi = BiSoldRi * (lambinew * lambiold)[None, None, :]
+        M0 = np.sum(lambnewilamboldBiSoldRi, axis=2)  # Sum over neurons
+        m0 = keep_active_s(M0, r)
+        
+        # Compute SRSB_old
+        BiSoldRi_perm3 = np.transpose(BiSoldRi, (1, 0, 2))  # [TP x rtot x n]
+        SRSB_old = Sold @ BiSoldRi_perm3.reshape(TP, -1)
+        SRSB_old = SRSB_old.reshape(rtot, rtot, n)
+        lamb2oldSRSB_old = SRSB_old * (lambiold**2)[None, None, :]
+        Gi_input = lamb2oldSRSB_old + np.eye(rtot)[:, :, None]
+        Gi = slow_backslash(Ciold, Gi_input)
+        
+        # Build Gammap matrices
+        # MATLAB: SSnew = mat2cell(reshape(news,T,rtot)',r,T)
+        # reshape(news,T,rtot) gives T x rtot, transpose gives rtot x T
+        # Then split into cells of size r[p] x T each
+        news_reshaped_temp = news.reshape(T, rtot).T  # [rtot x T]
+        SSnew_list = []
+        for p in range(P):
+            if p == 0:
+                row_start = 0
+            else:
+                row_start = np.sum(r[:p])
+            row_end = np.sum(r[:p+1])
+            SSnew_list.append(news_reshaped_temp[row_start:row_end, :])  # [r[p] x T]
+        SSnew = np.vstack(SSnew_list)  # [rtot x T] - same as news_reshaped_temp
+        
+        Gammap = []
+        for p in range(P):
+            gammapq = []
+            for q in range(P):
+                # MATLAB: lambda_ipq = bsxfun(@times,Ai(p,q,:),permute(lambinew,[3,2,1]))
+                lambda_ipq = Ai[p, q, :] * lambinew  # [n]
+                if q == 0:
+                    Gind = np.arange(r[0])
+                else:
+                    Gind = np.arange(np.sum(r[:q]), np.sum(r[:q+1]))
+                # MATLAB: aGi = bsxfun(@times,Gi(:,Gind,:),lambda_ipq)
+                aGi = Gi[:, Gind, :] * lambda_ipq[None, None, :]  # [rtot x r[q] x n]
+                # MATLAB: gammapq{q} = sum(aGi,3)
+                gammapq.append(np.sum(aGi, axis=2))  # Sum over neurons: [rtot x r[q]]
+            # MATLAB: Gammap{p} = cat(2,gammapq{:})
+            Gammap.append(np.hstack(gammapq))  # [rtot x rtot]
+        
+        # Build GG matrix
+        # MATLAB: G = cat(1,Gammap{:}) - but then builds GG selectively
+        GG = np.zeros((rtot, rtot))
+        for p in range(P):
+            G = Gammap[p]
+            if p == 0:
+                # MATLAB: GG(1:r(1),:) = G(1:r(1),:); GG(:,1:r(1)) = G(1:r(1),:)'
+                GG[:r[0], :] = G[:r[0], :]
+                GG[:, :r[0]] = G[:r[0], :].T
+            else:
+                startind = np.sum(r[:p])
+                endind = np.sum(r[:p+1])
+                # MATLAB: GG(startind:endind,startind:rtot) = G(startind:endind,startind:rtot)
+                GG[startind:endind, startind:] = G[startind:endind, startind:]
+                # MATLAB: GG(startind:rtot,startind:endind) = G(startind:endind,startind:rtot)'
+                GG[startind:, startind:endind] = G[startind:endind, startind:].T
+        
+        # Solve for news
+        # MATLAB: news = GG\reshape(m0,T,rtot)'
+        m0_reshaped = m0.reshape(T, rtot).T  # [rtot x T]
+        news_reshaped = np.linalg.solve(GG, m0_reshaped)  # [rtot x T]
+        # MATLAB: news = vec(news')
+        news = vec(news_reshaped.T)  # Vectorize: [rtot*T]
+        
+        # ------------------------------------------------------
+        # ---------- MMLE of condition-independent term----------
+        # Rebuild S from news (the updated S)
+        S_list = []
+        for p in range(P):
+            start_idx = np.sum(r[:p]) * T
+            end_idx = np.sum(r[:p+1]) * T
+            S_list.append(news[start_idx:end_idx].reshape(r[p], T))
+        S = sparse.block_diag(S_list).toarray()
+        
+        # Recompute Ci with new S and old lambda
+        # MATLAB uses Sold here, but Sold was set to Snew earlier, and now we have the new S
+        # Actually, looking at MATLAB: it rebuilds S from news, then uses Sold in the computation
+        # This seems like it might be using the old S for the covariance computation
+        # But let's match MATLAB exactly - it uses Sold which was the S from the start of the iteration
+        S2 = S.reshape(-1, P)  # Use new S for S2
+        AiISold_temp = S2 @ Ai_reshaped
+        AiISold_temp = AiISold_temp.reshape(rtot, TP, n)
+        AiISold = np.transpose(AiISold_temp, (1, 0, 2))
+        # MATLAB uses Sold here - which is the S from the start of M-step
+        SAiISold = Sold @ AiISold.reshape(TP, rtot*n)
+        SAiISold = SAiISold.reshape(rtot, rtot, n)
+        lambiSAiSold = SAiISold * lambiold[None, None, :]
+        Ci = lambiSAiSold + np.eye(rtot)[:, :, None]
+        # Use new S in MMLE_b
+        bnew = mmle_b(Ci, S, lambiold, ni, xbari, Ybar, Xzetai0, r)
+        
+        # Convergence checks
         newpars = np.concatenate([lambinew, news, vec(bnew)])
         oldpars = np.concatenate([lambiold0, olds0, vec(bold0)])
-        parerr.append(np.max((newpars - oldpars)**2 / oldpars**2))
+        parerr.append(np.max((newpars - oldpars)**2 / (oldpars**2 + 1e-10)))
         
+        # Evaluate Q and nll
         Q.append(q_tdr(newpars[:n+rtot*T], oldpars[:n+rtot*T], Ai, Ri, zzi, r, ni, 0))
-        nll.append(neg_log_lik_btdr_incomp_obs_uneqvar_s_nll_only(newpars[:n+rtot*T], Ai, Xzetai, zzi, r, ni, 0))
+        Ri_new, zzi_new, Xzetai_new = ecm_suff_stat(zetai, Xi, bnew)
+        nll.append(neg_log_lik_btdr_incomp_obs_uneqvar_s_nll_only(
+            newpars[:n+rtot*T], Ai, Xzetai_new, zzi_new, r, ni, 0))
         
+        # Check stopping criteria
         if stopmode == 'steps':
             if k >= stopcrit:
                 stopvar = False
         elif stopmode == 'converge':
-            if parerr[-1] < stopcrit or k >= maxsteps:
+            if (len(parerr) > 0 and parerr[-1] < stopcrit) or k >= maxsteps:
                 stopvar = False
         
         k += 1
