@@ -5,7 +5,7 @@ Estimation functions
 import numpy as np
 from scipy import sparse
 from scipy.optimize import minimize
-from .utils import vec, kronmult, slow_mult, slow_backslash, slow_chol
+from .utils import vec, kronmult, slow_mult, slow_backslash, slow_chol, quickkron_rxr_PTxPT, quickkron_PTxr_rxPT
 
 def mk_suff_stats_bilin_reg_sims(Z, X, hk):
     """
@@ -216,10 +216,12 @@ def est_pars_coord_ascent_lambi_s_b(lambhat0, shat0, bhat0, r, Ai, Xi, zetai, ni
         Ri, zzi, _ = ecm_suff_stat(zetai, Xi, bhat0)
         
         # estimate S conditioned on b0 and lambda
-        options = {'disp': False}
+        # MATLAB uses minFunc (L-BFGS-B like) for S optimization
+        # Use L-BFGS-B which is closer to MATLAB's minFunc
+        options = {'disp': False, 'maxiter': 1000}
         loglikS_lamb = lambda s: neg_log_lik_btdr_incomp_obs_uneqvar_s_only(
             s, lambhat0, Ai, Ri, zzi, r, ni, 0)
-        result = minimize(loglikS_lamb, shat0, method='BFGS', options=options)
+        result = minimize(loglikS_lamb, shat0, method='L-BFGS-B', options=options)
         shat = result.x
         
         Shat = []
@@ -230,9 +232,15 @@ def est_pars_coord_ascent_lambi_s_b(lambhat0, shat0, bhat0, r, Ai, Xi, zetai, ni
         Shatblock = sparse.block_diag(Shat).toarray()
         
         # estimate lambda conditioned on new S and b0
+        # MATLAB uses fminunc with trust-region-reflective
+        # Use trust-ncg which is closer (requires gradient)
         loglikfunLambda = lambda lamb: neg_log_lik_btdr_incomp_obs_uneqvar_lamb_only(
-            lamb, Shatblock, Ai, Ri, zzi, r, ni, 0)
-        result = minimize(loglikfunLambda, lambhat0, method='BFGS')
+            lamb, Shatblock, Ai, Ri, zzi, r, ni, 0, return_gradient=True)
+        # Wrap to handle gradient return
+        def loglikfunLambda_wrapper(lamb):
+            nll, grad = loglikfunLambda(lamb)
+            return nll, grad
+        result = minimize(loglikfunLambda_wrapper, lambhat0, method='L-BFGS-B', jac=True, options=options)
         lambhat = result.x
         
         # estimate b0 conditioned on new S and new lambda
@@ -282,8 +290,27 @@ def ecm_suff_stat(zetai, Xi, bhat0):
     
     return Ri, zzi, Xzetai
 
-def neg_log_lik_btdr_incomp_obs_uneqvar_s_only(s, lamb, Ai, Ri, zzi, r, ni, g):
-    """Negative log likelihood for S only"""
+def neg_log_lik_btdr_incomp_obs_uneqvar_s_only(s, lamb, Ai, Ri, zzi, r, ni, g, return_gradient=False, return_hessian=False):
+    """
+    Negative log likelihood for S only
+    
+    Args:
+        s: S parameters
+        lamb: lambda parameters
+        Ai: regressor covariances
+        Ri: population covariances
+        zzi: squared norms
+        r: ranks
+        ni: trial counts
+        g: regularization parameter
+        return_gradient: if True, also return gradient
+        return_hessian: if True, also return Hessian
+    
+    Returns:
+        negloglik: negative log likelihood
+        grad: gradient (if return_gradient=True)
+        Hess: Hessian (if return_hessian=True)
+    """
     P = len(r)
     T = Ri.shape[0] // P
     TP = T * P
@@ -308,7 +335,7 @@ def neg_log_lik_btdr_incomp_obs_uneqvar_s_only(s, lamb, Ai, Ri, zzi, r, ni, g):
     # In MATLAB, reshape(S, [], P) with S being rtot x TP gives (rtot*TP/P) x P = rtot*T x P
     # But we want rtot x TP reshaped to have P columns, so it's (rtot*TP/P) x P
     # Actually, let me check: S is rtot x (T*P), so reshape(S, [], P) gives (rtot*T*P/P) x P = rtot*T x P
-    # In Python, S.reshape(-1, P) with S being rtot x TP gives (rtot*TP/P) x P = rtot*T x P ✓
+    # In Python, S.reshape(-1, P) with S being rtot x TP gives (rtot*TP/P) x P = rtot*T x P
     # MATLAB: lambAiIS = permute(reshape(S2*lambAi,rtot,TP,n),[2 1 3])
     lambAiIS = S2 @ lambAi  # [rtot*T x P] @ [P x P*n] = [rtot*T x P*n]
     lambAiIS = lambAiIS.reshape(rtot, TP, n)  # Reshape to [rtot x TP x n]
@@ -325,7 +352,12 @@ def neg_log_lik_btdr_incomp_obs_uneqvar_s_only(s, lamb, Ai, Ri, zzi, r, ni, g):
     invCiSRi = slow_backslash(Ci, SRi)
     
     # Quadratic term: Qtermi = invCiSRi' * vec(S) for each neuron
-    Qtermi = np.array([invCiSRi[:, :, i].T @ vec(S.T) for i in range(n)])
+    # MATLAB: Qtermi = reshape(permute(invCiSRi,[3,1,2]),n,rtot*TP)*sparse(vec(S))
+    # invCiSRi is [rtot x TP x n], permute([3,1,2]) gives [n x rtot x TP]
+    invCiSRi_perm = np.transpose(invCiSRi, (2, 0, 1))  # [n x rtot x TP]
+    invCiSRi_reshaped = invCiSRi_perm.reshape(n, rtot*TP)  # [n x rtot*TP]
+    vec_S = vec(S)  # [rtot*TP]
+    Qtermi = invCiSRi_reshaped @ vec_S  # [n]
     Qterm = (lamb**2) @ Qtermi
     
     # log-det term using cholesky
@@ -338,10 +370,149 @@ def neg_log_lik_btdr_incomp_obs_uneqvar_s_only(s, lamb, Ai, Ri, zzi, r, ni, g):
     # Negative log likelihood
     negloglik = 0.5 * (-T * ni @ np.log(lamb) + logdetterm + zzi @ lamb - Qterm + regterm)
     
+    if not return_gradient and not return_hessian:
+        return negloglik
+    
+    # Compute gradient
+    if return_gradient or return_hessian:
+        # MATLAB: lambinvCiSAiI = slowBackslash(Ci,permute(lambAiIS,[2 1 3]))
+        lambAiIS_perm = np.transpose(lambAiIS, (1, 0, 2))  # [rtot x TP x n]
+        lambinvCiSAiI = slow_backslash(Ci, lambAiIS_perm)
+        
+        # MATLAB: dLdS computation
+        # lambSinvCiSAiI = reshape(S'*reshape(lambinvCiSAiI,rtot,TP*n),TP,TP,n)
+        lambinvCiSAiI_reshaped = lambinvCiSAiI.reshape(rtot, TP*n)
+        lambSinvCiSAiI = S.T @ lambinvCiSAiI_reshaped
+        lambSinvCiSAiI = lambSinvCiSAiI.reshape(TP, TP, n)
+        
+        # MATLAB: M = bsxfun(@plus,-lambSinvCiSAiI,eye(TP))
+        M = -lambSinvCiSAiI + np.eye(TP)[:, :, None]
+        # MATLAB: M = bsxfun(@times,M,permute(lamb.^2, [3 2 1]))
+        M = M * (lamb**2)[None, None, :]
+        
+        # MATLAB: dLdS = lambinvCiSAiI - slowMult(invCiSRi,M)
+        dLdS = lambinvCiSAiI - slow_mult(invCiSRi, M)
+        # MATLAB: dLdS = squeeze(sum(dLdS,3)) + g*S
+        dLdS = np.sum(dLdS, axis=2) + g * S
+        
+        # Only keep the parts of dLdS we need
+        # MATLAB: dLds = [dLds; vec(dLdSp')] for each p
+        dLds = []
+        for p in range(P):
+            colind = np.arange(T * p, T * (p + 1))
+            if p == 0:
+                rowind = np.arange(int(r[0]))
+            else:
+                rowind = np.arange(int(np.sum(r[:p])), int(np.sum(r[:p+1])))
+            # Use np.ix_ for proper advanced indexing
+            dLdSp = dLdS[np.ix_(rowind, colind)]
+            dLds.extend(vec(dLdSp.T))
+        
+        grad = np.array(dLds)
+        
+        if not return_hessian:
+            return negloglik, grad
+    
+    # Compute Hessian (if requested)
+    if return_hessian:
+        # MATLAB lines 117-151 compute Hessian
+        # Calculate 2nd derivatives over all elements of S
+        # Note: This is a simplified implementation. The full MATLAB version uses
+        # specialized quickkron functions for efficient block-structured Kronecker products.
+        # MATLAB: invCiS = slowBackslash(Ci,repmat(S,1,1,n))
+        S_rep = np.tile(S[:, :, None], (1, 1, n))  # [rtot x TP x n]
+        invCiS = slow_backslash(Ci, S_rep)  # [rtot x TP x n]
+        
+        # MATLAB: H1 = zeros(T*sum(r)); H2 = zeros(T*sum(r));
+        H1 = np.zeros((rtot*T, rtot*T))
+        H2 = np.zeros((rtot*T, rtot*T))
+        
+        # MATLAB: Md1L0 = bsxfun(@plus, -permute(lambSinvCiSAiI,[2 1 3]),eye(TP))
+        lambSinvCiSAiI_perm = np.transpose(lambSinvCiSAiI, (1, 0, 2))  # [TP x TP x n]
+        Md1L0 = -lambSinvCiSAiI_perm + np.eye(TP)[:, :, None]  # [TP x TP x n]
+        # MATLAB: Md1L0 = reshape(Md1L0,[],P,n)
+        Md1L0 = Md1L0.reshape(-1, P, n)  # [TP*TP x P x n]
+        
+        for i in range(n):
+            # MATLAB: invCi = inv(squeeze(Ci(:,:,i)))
+            invCi = np.linalg.inv(Ci[:, :, i])  # [rtot x rtot]
+            
+            # MATLAB: Md1L = lambi(i)*reshape(Md1L0(:,:,i)*Ai(:,:,i),[],TP)'
+            Md1L_temp = Md1L0[:, :, i] @ Ai[:, :, i]  # [TP*TP x P] @ [P x P] = [TP*TP x P]
+            Md1L = lamb[i] * Md1L_temp.reshape(-1, TP).T  # [TP x TP]
+            
+            # MATLAB: lambiAi_ITSinvCiSRi = lambAiIS(:,:,i)*invCiSRi(:,:,i)
+            lambiAi_ITSinvCiSRi = lambAiIS[:, :, i] @ invCiSRi[:, :, i]  # [TP x rtot] @ [rtot x TP] = [TP x TP]
+            
+            # MATLAB: lambAi_ITSinvCiSRiSinvCi = lambiAi_ITSinvCiSRi*invCiS(:,:,i)'
+            lambAi_ITSinvCiSRiSinvCi = lambiAi_ITSinvCiSRi @ invCiS[:, :, i].T  # [TP x TP] @ [TP x rtot] = [TP x rtot]
+            
+            # MATLAB: Md2_1_IIL = -lambi(i)^2*invCiSRi(:,:,i) + lambinvCiSAiI(:,:,i)
+            Md2_1_IIL = -lamb[i]**2 * invCiSRi[:, :, i] + lambinvCiSAiI[:, :, i]  # [rtot x TP]
+            
+            # MATLAB: Md2_1_II_IIIL = Md2_1_IIL + lambi(i)^2*lambAi_ITSinvCiSRiSinvCi'
+            Md2_1_II_IIIL = Md2_1_IIL + lamb[i]**2 * lambAi_ITSinvCiSRiSinvCi.T  # [rtot x TP]
+            
+            # MATLAB: M_II_IIIR = lambi(i)^2*(invCiSRi(:,:,i)' - lambAi_ITSinvCiSRiSinvCi)
+            M_II_IIIR = lamb[i]**2 * (invCiSRi[:, :, i].T - lambAi_ITSinvCiSRiSinvCi)  # [TP x rtot]
+            
+            # MATLAB: M_I_IVL1 = lambi(i)^2*Md1L
+            M_I_IVL1 = lamb[i]**2 * Md1L  # [TP x TP]
+            
+            # MATLAB: M_I_IVL2 = lambiAi_ITSinvCiSRi - lambAiIS(:,:,i)*lambAi_ITSinvCiSRiSinvCi'
+            M_I_IVL2 = lambiAi_ITSinvCiSRi - lambAiIS[:, :, i] @ lambAi_ITSinvCiSRiSinvCi.T  # [TP x TP]
+            
+            # MATLAB: M1_I_IIIL = Ri(:,:,i)-lambiAi_ITSinvCiSRi
+            M1_I_IIIL = Ri[:, :, i] - lambiAi_ITSinvCiSRi  # [TP x TP]
+            
+            # MATLAB: M_d1_I_IVL = (Md1L+lambi(i)*lambi(i)*(M_I_IVL2 - M1_I_IIIL))
+            M_d1_I_IVL = Md1L + lamb[i]**2 * (M_I_IVL2 - M1_I_IIIL)  # [TP x TP]
+            
+            # MATLAB uses quickkron_rxr_PTxPT and quickkron_PTxr_rxPT for efficient computation
+            # These compute block-structured Kronecker products matching the S matrix structure
+            term1 = invCiSRi[:, :, i] @ invCiS[:, :, i].T  # [rtot x rtot]
+            
+            # For H1: quickkron_rxr_PTxPT(M_I_IVL1, term1, r, P, T)
+            # M_I_IVL1 is [TP x TP], term1 is [rtot x rtot]
+            H1 += quickkron_rxr_PTxPT(M_I_IVL1, term1, r, P, T)
+            # quickkron_rxr_PTxPT(M_d1_I_IVL, invCi, r, P, T)
+            H1 += quickkron_rxr_PTxPT(M_d1_I_IVL, invCi, r, P, T)
+            
+            # For H2: quickkron_PTxr_rxPT operations
+            # lambinvCiSAiI is [rtot x TP], M_II_IIIR is [TP x rtot]
+            H2 += quickkron_PTxr_rxPT(lambinvCiSAiI[:, :, i], M_II_IIIR, r, P, T)
+            # quickkron_PTxr_rxPT(Md2_1_II_IIIL, lambinvCiSAiI(:, :, i)', r, P, T)
+            H2 -= quickkron_PTxr_rxPT(Md2_1_II_IIIL, lambinvCiSAiI[:, :, i].T, r, P, T)
+        
+        # MATLAB: H = H1 + H2; Hess = .5*(H + H')
+        H = H1 + H2
+        Hess = 0.5 * (H + H.T)  # Make symmetric
+        # Add regularization term: g * I
+        Hess += g * np.eye(rtot*T)
+        
+        return negloglik, grad, Hess
+    
     return negloglik
 
-def neg_log_lik_btdr_incomp_obs_uneqvar_lamb_only(lamb, S, Ai, Ri, zzi, r, ni, g):
-    """Negative log likelihood for lambda only"""
+def neg_log_lik_btdr_incomp_obs_uneqvar_lamb_only(lamb, S, Ai, Ri, zzi, r, ni, g, return_gradient=False):
+    """
+    Negative log likelihood for lambda only
+    
+    Args:
+        lamb: lambda parameters
+        S: S matrix
+        Ai: regressor covariances
+        Ri: population covariances
+        zzi: squared norms
+        r: ranks
+        ni: trial counts
+        g: regularization parameter
+        return_gradient: if True, also return gradient
+    
+    Returns:
+        negloglik: negative log likelihood
+        grad: gradient (if return_gradient=True)
+    """
     P = len(r)
     T = Ri.shape[0] // P
     TP = T * P
@@ -391,7 +562,55 @@ def neg_log_lik_btdr_incomp_obs_uneqvar_lamb_only(lamb, S, Ai, Ri, zzi, r, ni, g
     # Negative log likelihood
     negloglik = 0.5 * (-T * ni @ np.log(lamb) + logdetterm + zzi @ lamb - Qterm + regterm)
     
-    return negloglik
+    if not return_gradient:
+        return negloglik
+    
+    # Compute gradient
+    # MATLAB: lambinvCiSAiI = slowBackslash(Ci,permute(lambAiIS,[2 1 3]))
+    # lambAiIS is [TP x rtot x n], permute([2 1 3]) gives [rtot x TP x n]
+    lambAiIS_perm = np.transpose(lambAiIS, (1, 0, 2))  # [rtot x TP x n]
+    lambinvCiSAiI = slow_backslash(Ci, lambAiIS_perm)  # [rtot x TP x n]
+    
+    # MATLAB: invCiSAiI = bsxfun(@times,lambinvCiSAiI,permute(repmat(1./lambi,1,P*T),[3 2 1]))
+    # Divide by lamb for each neuron: [rtot x TP x n] / [1 x 1 x n]
+    invCiSAiI = lambinvCiSAiI / lamb[None, None, :]  # [rtot x TP x n]
+    
+    # MATLAB: SinvCiSRi = reshape(S'*reshape(invCiSRi,sum(r),n*P*T),P*T,P*T,n)
+    # invCiSRi is [rtot x TP x n], reshape to [rtot x n*TP]
+    invCiSRi_reshaped = invCiSRi.reshape(rtot, n*TP)
+    # S is [rtot x TP], S.T is [TP x rtot]
+    SinvCiSRi = S.T @ invCiSRi_reshaped  # [TP x rtot] @ [rtot x n*TP] = [TP x n*TP]
+    SinvCiSRi = SinvCiSRi.reshape(TP, TP, n)
+    
+    # MATLAB: F = bsxfun(@times,SinvCiSRi,permute(repmat(lambi.^2,1,P*T),[3 2 1]))
+    F = SinvCiSRi * (lamb**2)[None, None, :]  # [TP x TP x n]
+    # MATLAB: F(ind) = ones(size(ind)) + F(ind) - Add identity to diagonal
+    # ind = sub2ind(size(F), x1(:), x1(:), x2(:)) where x1 = 1:T*P, x2 = 1:n
+    # This adds identity to diagonal for each n
+    for i in range(n):
+        np.fill_diagonal(F[:, :, i], 1.0 + np.diag(F[:, :, i]))
+    
+    # MATLAB: F = slowMult(invCiSAiI,F)
+    # invCiSAiI is [rtot x TP x n], F is [TP x TP x n]
+    # Need to check dimensions: slow_mult expects matching 3rd dimension
+    # invCiSAiI @ F for each n: [rtot x TP] @ [TP x TP] = [rtot x TP]
+    F_result = np.zeros((rtot, TP, n))
+    for i in range(n):
+        F_result[:, :, i] = invCiSAiI[:, :, i] @ F[:, :, i]
+    F = F_result
+    
+    # MATLAB: dQdlambi = reshape(permute(F,[3,2,1]),n,sum(r)*T*P)*vec(S')
+    # F is [rtot x TP x n], permute([3,2,1]) gives [n x TP x rtot]
+    F_perm = np.transpose(F, (2, 1, 0))  # [n x TP x rtot]
+    F_reshaped = F_perm.reshape(n, TP*rtot)  # [n x TP*rtot] = [n x rtot*TP]
+    dQdlambi = F_reshaped @ vec(S.T)  # [n x rtot*TP] @ [rtot*TP x 1] = [n]
+    
+    # MATLAB: dLdlambi = .5*(-T*ni'./lambi + zzi - 2*lambi.*Qtermi + dQdlambi)
+    dLdlambi = 0.5 * (-T * ni / lamb + zzi - 2 * lamb * Qtermi + dQdlambi)
+    
+    grad = dLdlambi
+    
+    return negloglik, grad
 
 def ecm_regress_wrapper(r, init_regress_fun, em_regress_fun, Ybar):
     """
@@ -494,7 +713,7 @@ def make_bhat_data(histfile, Ai, Xzetai, r, b=None):
         Shat.append(shat[startind:endind].reshape(T, r[p]).T)
     
     Shatblock = sparse.block_diag(Shat).toarray()
-    Wt = eb_post_W_uneqvar(Shatblock, lambhat, Ai, Xzetai, np.sum(r))
+    Wt, Ci = eb_post_W_uneqvar(Shatblock, lambhat, Ai, Xzetai, np.sum(r))
     
     Bhat = []
     What = []
@@ -517,7 +736,8 @@ def eb_post_W_uneqvar(Shatblock, lambhat, Ai, Xzetai, rtot):
         rtot: total rank
     
     Returns:
-        Wt: posterior weights
+        Wt: posterior weights [rtot x n]
+        Ci: covariance matrices [rtot x rtot x n]
     """
     P, _, n = Ai.shape
     T = Shatblock.shape[1] // P
@@ -539,7 +759,7 @@ def eb_post_W_uneqvar(Shatblock, lambhat, Ai, Xzetai, rtot):
         # Solve for Wt: Ci \ (SXIZi * lambi)
         Wt[:, i] = np.linalg.solve(Ci[:, :, i], SXIZi[:, i]) * lambhat[i]
     
-    return Wt
+    return Wt, Ci
 
 def btdr_aic_s_lamb_b_wrapper(pars, Ai, Xi, zetai, r, ni, g):
     """
@@ -654,7 +874,7 @@ def neg_log_lik_btdr_incomp_obs_uneqvar_s_nll_only(pars, Ai, Xzetai, zzi, r, ni,
     
     return negloglik
 
-def q_tdr(par_new, par_old, Ai, Ri, zzi, r, ni, alpha):
+def q_tdr(par_new, par_old, Ai, Ri, zzi, r, ni, alpha, return_gradient=False):
     """
     Q function for TDR
     
@@ -667,10 +887,11 @@ def q_tdr(par_new, par_old, Ai, Ri, zzi, r, ni, alpha):
         r: ranks
         ni: trial counts
         alpha: regularization parameter
+        return_gradient: if True, also return gradient
     
     Returns:
         Q: Q function value
-        dQ: gradient (optional)
+        dQ: gradient (if return_gradient=True)
     """
     P = len(r)
     T = Ri.shape[0] // P
@@ -698,18 +919,22 @@ def q_tdr(par_new, par_old, Ai, Ri, zzi, r, ni, alpha):
     # make new feature covariance
     lambnewAi = Ai * lambinew[None, None, :]
     lambnewAi = lambnewAi.reshape(P, P*n)
-    S2 = Snew.reshape(-1, P)
-    lambAiISnew = np.transpose(S2 @ lambnewAi.reshape(-1, n), (1, 0, 2))
-    lambAiISnew = lambAiISnew.reshape(rtot, TP, n)
+    S2_new = Snew.reshape(-1, P)  # Reshape Snew to have P columns
+    lambAiISnew_temp = S2_new @ lambnewAi  # [rtot*T x P] @ [P x P*n] = [rtot*T x P*n]
+    lambAiISnew_temp = lambAiISnew_temp.reshape(rtot, TP, n)
+    lambAiISnew = np.transpose(lambAiISnew_temp, (1, 0, 2))  # [TP x rtot x n]
     lambiSAiSnew = Snew @ lambAiISnew.reshape(TP, rtot*n)
     lambiSAiSnew = lambiSAiSnew.reshape(rtot, rtot, n)
     Cinew = lambiSAiSnew + np.eye(rtot)[:, :, None]
     
     # make old feature covariance
+    # CRITICAL FIX: Use S2_old from Sold, not S2 from Snew
     lamboldAi = Ai * lambiold[None, None, :]
     lamboldAi = lamboldAi.reshape(P, P*n)
-    lambAiISold = np.transpose(S2 @ lamboldAi.reshape(-1, n), (1, 0, 2))
-    lambAiISold = lambAiISold.reshape(rtot, TP, n)
+    S2_old = Sold.reshape(-1, P)  # Reshape Sold to have P columns (MATLAB line 36)
+    lambAiISold_temp = S2_old @ lamboldAi  # [rtot*T x P] @ [P x P*n] = [rtot*T x P*n]
+    lambAiISold_temp = lambAiISold_temp.reshape(rtot, TP, n)
+    lambAiISold = np.transpose(lambAiISold_temp, (1, 0, 2))  # [TP x rtot x n]
     lambiSAiSold = Sold @ lambAiISold.reshape(TP, rtot*n)
     lambiSAiSold = lambiSAiSold.reshape(rtot, rtot, n)
     Ciold = lambiSAiSold + np.eye(rtot)[:, :, None]
@@ -735,7 +960,101 @@ def q_tdr(par_new, par_old, Ai, Ri, zzi, r, ni, alpha):
     
     Q = T * ni @ np.log(lambinew) - Quad1 + Quad2 - Quad3 - Quad4 - alpha * (snew - sold) @ (snew - sold)
     
-    return Q
+    if not return_gradient:
+        return Q
+    
+    # Compute gradient
+    # --------------------
+    # dQdlambdai
+    # MATLAB: g1i = 2*lambiold.*(reshape(permute(BiSoldRi,[3,1,2]),n,rtot*TP)*vec(Snew))
+    BiSoldRi_perm = np.transpose(BiSoldRi, (2, 0, 1))  # [n x rtot x TP]
+    BiSoldRi_reshaped = BiSoldRi_perm.reshape(n, rtot*TP)
+    g1i = 2 * lambiold * (BiSoldRi_reshaped @ vec(Snew.T))
+    
+    # MATLAB: BiSASlambi = slowBackslash(Ciold,lambiSAiSnew)
+    BiSASlambi = slow_backslash(Ciold, lambiSAiSnew)
+    # MATLAB: g2i(ii) = trace(BiSASlambi(:,:,ii))./lambinew(ii)
+    g2i = np.array([np.trace(BiSASlambi[:, :, ii]) / lambinew[ii] for ii in range(n)])
+    
+    # MATLAB: RSBSASBlambi = slowMult(permute(BiSoldRi,[2,1,3]),permute(BiSASlambi,[2,1,3]))
+    BiSoldRi_perm2 = np.transpose(BiSoldRi, (1, 0, 2))  # [TP x rtot x n]
+    BiSASlambi_perm = np.transpose(BiSASlambi, (1, 0, 2))  # [rtot x rtot x n]
+    # Note: BiSoldRi is [rtot x TP x n], so permute([2,1,3]) gives [TP x rtot x n]
+    # But we need to check dimensions - BiSoldRi is [rtot x TP x n] after transpose
+    # Actually, BiSoldRi after line 725 is [rtot x TP x n]
+    # permute([2,1,3]) means: dim2, dim1, dim3 -> [TP x rtot x n]
+    RSBSASBlambi = slow_mult(BiSoldRi_perm2, BiSASlambi_perm)  # [TP x rtot x n] @ [rtot x rtot x n] -> [TP x rtot x n]
+    # MATLAB: g3i = reshape(permute(RSBSASBlambi,[3,1,2]),n,rtot*TP)*vec(Sold')
+    RSBSASBlambi_perm = np.transpose(RSBSASBlambi, (2, 1, 0))  # [n x rtot x TP]
+    RSBSASBlambi_reshaped = RSBSASBlambi_perm.reshape(n, rtot*TP)
+    g3i = RSBSASBlambi_reshaped @ vec(Sold.T)
+    # MATLAB: g3i = g3i./lambinew.*lambiold.*lambiold
+    g3i = g3i / lambinew * lambiold * lambiold
+    
+    # MATLAB: dQdlamb = T*ni'./lambinew-zzi + g1i - g2i - g3i
+    dQdlamb = T * ni / lambinew - zzi + g1i - g2i - g3i
+    
+    # --------------------
+    # dQdSnew
+    # MATLAB: SRSB_old = reshape(Sold*reshape(permute(BiSoldRi,[2,1,3]),TP,[]),rtot,rtot,n)
+    BiSoldRi_perm3 = np.transpose(BiSoldRi, (1, 0, 2))  # [TP x rtot x n]
+    SRSB_old = Sold @ BiSoldRi_perm3.reshape(TP, -1)
+    SRSB_old = SRSB_old.reshape(rtot, rtot, n)
+    # MATLAB: lamb2oldSRSB_old = bsxfun(@times,SRSB_old,permute(lambiold.^2,[3,2,1]))
+    lamb2oldSRSB_old = SRSB_old * (lambiold**2)[None, None, :]
+    # MATLAB: Gi = slowBackslash(Ciold,bsxfun(@plus,lamb2oldSRSB_old,eye(rtot)))
+    Gi_input = lamb2oldSRSB_old + np.eye(rtot)[:, :, None]
+    Gi = slow_backslash(Ciold, Gi_input)
+    
+    # MATLAB: SSnew = mat2cell(reshape(snew,T,rtot)',r,T); SSnew = cat(1,SSnew{:})
+    # reshape(snew,T,rtot)' gives [rtot x T], then split by r[p] rows
+    snew_reshaped = snew.reshape(T, rtot).T  # [rtot x T]
+    SSnew_list = []
+    for p in range(P):
+        if p == 0:
+            row_start = 0
+        else:
+            row_start = np.sum(r[:p])
+        row_end = np.sum(r[:p+1])
+        SSnew_list.append(snew_reshaped[row_start:row_end, :])  # [r[p] x T]
+    SSnew = np.vstack(SSnew_list)  # [rtot x T]
+    
+    # Build Gammap matrices
+    Gammap = []
+    for p in range(P):
+        gammapq = []
+        for q in range(P):
+            # MATLAB: lambda_ipq = bsxfun(@times,Ai(p,q,:),permute(lambinew,[3,2,1]))
+            lambda_ipq = Ai[p, q, :] * lambinew  # [n]
+            if q == 0:
+                Gind = np.arange(r[0])
+            else:
+                Gind = np.arange(np.sum(r[:q]), np.sum(r[:q+1]))
+            # MATLAB: aGi = bsxfun(@times,Gi(:,Gind,:),lambda_ipq)
+            aGi = Gi[:, Gind, :] * lambda_ipq[None, None, :]  # [rtot x r[q] x n]
+            # MATLAB: gammapq{q} = sum(aGi,3)
+            gammapq.append(np.sum(aGi, axis=2))  # Sum over neurons: [rtot x r[q]]
+        # MATLAB: Gammap{p} = cat(2,gammapq{:})
+        Gammap.append(np.hstack(gammapq))  # [rtot x rtot]
+    
+    # MATLAB: tempmat = reshape(cat(1,Gammap{:})*SSnew,rtot,P,T)
+    G_all = np.vstack(Gammap)  # [rtot*P x rtot]
+    tempmat = (G_all @ SSnew).reshape(rtot, P, T)  # [rtot x P x T]
+    # MATLAB: lambGiSAi = reshape(permute(tempmat,[1,3,2]),rtot,TP)
+    lambGiSAi = np.transpose(tempmat, (0, 2, 1)).reshape(rtot, TP)  # [rtot x TP]
+    
+    # MATLAB: dQdS = sum(lambnewilamboldBiSoldRi,3) - lambGiSAi - alpha*(Snew-Sold)
+    lambnewilamboldBiSoldRi = BiSoldRi * (lambinew * lambiold)[None, None, :]
+    M0 = np.sum(lambnewilamboldBiSoldRi, axis=2)  # Sum over neurons: [rtot x TP]
+    dQdS = M0 - lambGiSAi - alpha * (Snew - Sold)
+    
+    # MATLAB: dQds = keepActive_S(dQdS,r)
+    dQds = keep_active_s(dQdS, r)
+    
+    # MATLAB: dQ = [dQdlamb;2*dQds]
+    dQ = np.concatenate([dQdlamb, 2 * dQds])
+    
+    return Q, dQ
 
 def keep_active_s(S, r):
     """
@@ -756,10 +1075,11 @@ def keep_active_s(S, r):
     for p in range(P):
         colind = np.arange(T * p, T * (p + 1))
         if p == 0:
-            rowind = np.arange(r[0])
+            rowind = np.arange(int(r[0]))
         else:
-            rowind = np.arange(np.sum(r[:p]), np.sum(r[:p+1]))
-        Sp = S[rowind, colind]
+            rowind = np.arange(int(np.sum(r[:p])), int(np.sum(r[:p+1])))
+        # Use proper indexing: S[rowind, :][:, colind] or use np.ix_
+        Sp = S[np.ix_(rowind, colind)]  # Extract submatrix using np.ix_ for proper indexing
         s.extend(vec(Sp.T))
     
     return np.array(s)
